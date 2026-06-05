@@ -3169,15 +3169,13 @@ fn policy_record_to_revision(record: &PolicyRecord, include_policy: bool) -> San
 
 /// Re-validate security notes server-side for a proposed policy chunk.
 fn generate_security_notes(host: &str, port: u16) -> String {
+    use openshell_core::net::host_appears_internal;
+
     let mut notes = Vec::new();
 
-    if host.starts_with("10.")
-        || host.starts_with("172.")
-        || host.starts_with("192.168.")
-        || host == "localhost"
-        || host.starts_with("127.")
-        || host.starts_with("169.254.")
-    {
+    // Flag internal/private/special-use destinations using the canonical
+    // classifier rather than naive string prefixes. See `openshell_core::net`.
+    if host_appears_internal(host) {
         notes.push(format!(
             "Destination '{host}' appears to be an internal/private address."
         ));
@@ -3858,6 +3856,17 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use tonic::Code;
+
+    #[test]
+    fn test_generate_security_notes_classifies_hosts() {
+        // Literal private IP is flagged.
+        assert!(generate_security_notes("10.0.0.1", 443).contains("internal/private"));
+        // RFC 1918 boundary is respected (172.16.0.0/12, not 172.0.0.0/8).
+        assert!(generate_security_notes("172.16.0.1", 443).contains("internal/private"));
+        assert!(!generate_security_notes("172.15.0.1", 443).contains("internal/private"));
+        // Public hostnames must not be misclassified by prefix matching.
+        assert!(!generate_security_notes("10.example.org", 443).contains("internal/private"));
+    }
 
     /// Wrap a request with a user `Principal` so handler scope guards treat
     /// the test caller as a CLI user. Most handler tests exercise

@@ -188,32 +188,55 @@ pub fn is_internal_ip(ip: IpAddr) -> bool {
     }
 }
 
+/// Advisory heuristic: does `host` denote an internal/private/special-use
+/// destination, for the purpose of annotating proposed policy rules?
+///
+/// Literal IP hosts are parsed and classified with [`is_internal_ip`]; non-IP
+/// hosts are only matched against well-known internal names (`localhost` and
+/// cloud metadata hostnames). DNS is intentionally never resolved here, so a
+/// public hostname such as `10.example.org` is not misclassified as private.
+pub fn host_appears_internal(host: &str) -> bool {
+    let trimmed = host.trim();
+    if let Ok(ip) = trimmed.parse::<IpAddr>() {
+        return is_internal_ip(ip);
+    }
+    let normalized = trimmed.trim_end_matches('.').to_ascii_lowercase();
+    normalized == "localhost" || is_known_metadata_hostname(host)
+}
+
 /// IPv4 internal address check covering RFC 1918, CGNAT (RFC 6598), and other
 /// special-use ranges that should never be reachable from sandbox egress.
+///
+/// Stable `std::net` predicates are preferred over hand-rolled range checks.
+/// The remaining manual checks cover ranges whose `std::net` predicates are
+/// still nightly-only (`#![feature(ip)]`, rust-lang/rust#27709), so they cannot
+/// be called on the pinned stable toolchain.
 fn is_internal_v4(v4: Ipv4Addr) -> bool {
-    if v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified() {
+    // Stable predicates: RFC 1918 (`is_private`), loopback, link-local/APIPA,
+    // unspecified, RFC 5737 documentation/TEST-NET-1/2/3 (`is_documentation`),
+    // and the limited broadcast address (`is_broadcast`).
+    if v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_unspecified()
+        || v4.is_documentation()
+        || v4.is_broadcast()
+    {
         return true;
     }
     let octets = v4.octets();
-    // 100.64.0.0/10 — CGNAT / shared address space (RFC 6598). Commonly used by
-    // cloud VPC peering, Tailscale, and similar overlay networks.
+    // 100.64.0.0/10 — CGNAT / shared address space (RFC 6598, nightly
+    // `is_shared`). Commonly used by cloud VPC peering, Tailscale, and similar
+    // overlay networks.
     if octets[0] == 100 && (octets[1] & 0xC0) == 64 {
         return true;
     }
-    // 192.0.0.0/24 — IETF protocol assignments (RFC 6890)
-    if octets[0] == 192 && octets[1] == 0 && octets[2] == 0 {
-        return true;
-    }
-    // 198.18.0.0/15 — benchmarking (RFC 2544)
+    // 198.18.0.0/15 — benchmarking (RFC 2544, nightly `is_benchmarking`).
     if octets[0] == 198 && (octets[1] & 0xFE) == 18 {
         return true;
     }
-    // 198.51.100.0/24 — TEST-NET-2 (RFC 5737)
-    if octets[0] == 198 && octets[1] == 51 && octets[2] == 100 {
-        return true;
-    }
-    // 203.0.113.0/24 — TEST-NET-3 (RFC 5737)
-    if octets[0] == 203 && octets[1] == 0 && octets[2] == 113 {
+    // 192.0.0.0/24 — IETF protocol assignments (RFC 6890; no stable predicate).
+    if octets[0] == 192 && octets[1] == 0 && octets[2] == 0 {
         return true;
     }
     false
@@ -567,15 +590,58 @@ mod tests {
         // 198.18.0.0/15 — benchmarking
         assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1))));
         assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(198, 19, 255, 255))));
-        // 198.51.100.0/24 — TEST-NET-2
+        // 192.0.2.0/24 — TEST-NET-1 (RFC 5737)
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))));
+        // 198.51.100.0/24 — TEST-NET-2 (RFC 5737)
         assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1))));
-        // 203.0.113.0/24 — TEST-NET-3
+        // 203.0.113.0/24 — TEST-NET-3 (RFC 5737)
         assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))));
+        // 255.255.255.255 — limited broadcast
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::BROADCAST)));
     }
 
     #[test]
     fn test_internal_ip_ipv6_mapped_cgnat() {
         let v6 = Ipv4Addr::new(100, 64, 0, 1).to_ipv6_mapped();
         assert!(is_internal_ip(IpAddr::V6(v6)));
+    }
+
+    // -- host_appears_internal --
+
+    #[test]
+    fn test_host_appears_internal_literal_ips() {
+        assert!(host_appears_internal("10.0.0.1"));
+        assert!(host_appears_internal("172.16.0.1"));
+        assert!(host_appears_internal("192.168.1.1"));
+        assert!(host_appears_internal("127.0.0.1"));
+        assert!(host_appears_internal("169.254.169.254"));
+        assert!(host_appears_internal("100.64.0.1")); // CGNAT
+        assert!(host_appears_internal("::1"));
+        assert!(host_appears_internal("fd12:3456:789a:1::1")); // IPv6 ULA
+    }
+
+    #[test]
+    fn test_host_appears_internal_public_ips() {
+        assert!(!host_appears_internal("8.8.8.8"));
+        // 172.15 and 172.32 are outside the RFC 1918 172.16.0.0/12 block.
+        assert!(!host_appears_internal("172.15.0.1"));
+        assert!(!host_appears_internal("172.32.0.1"));
+    }
+
+    #[test]
+    fn test_host_appears_internal_hostnames_not_misclassified() {
+        // Regression: naive prefix matching used to flag these as private.
+        assert!(!host_appears_internal("10.example.org"));
+        assert!(!host_appears_internal("172.foo.com"));
+        assert!(!host_appears_internal("127.acme.io"));
+        assert!(!host_appears_internal("api.github.com"));
+    }
+
+    #[test]
+    fn test_host_appears_internal_known_names() {
+        assert!(host_appears_internal("localhost"));
+        assert!(host_appears_internal("localhost."));
+        assert!(host_appears_internal("LOCALHOST"));
+        assert!(host_appears_internal("metadata.google.internal"));
     }
 }

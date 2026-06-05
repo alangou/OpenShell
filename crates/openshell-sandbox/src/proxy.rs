@@ -4644,10 +4644,14 @@ network_policies:
         // 198.18.0.0/15 — benchmarking
         assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1))));
         assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(198, 19, 255, 255))));
+        // 192.0.2.0/24 — TEST-NET-1 (RFC 5737)
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))));
         // 198.51.100.0/24 — TEST-NET-2
         assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1))));
         // 203.0.113.0/24 — TEST-NET-3
         assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))));
+        // 255.255.255.255 — limited broadcast
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::BROADCAST)));
     }
 
     #[test]
